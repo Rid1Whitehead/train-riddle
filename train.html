@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Morning Commute</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; width: 100vw; height: 100vh; }
+  canvas { display: block; }
+  .label {
+    position: fixed;
+    top: 28px;
+    left: 50%;
+    transform: translateX(-50%);
+    text-align: center;
+    color: #4a5568;
+    opacity: 0.45;
+    pointer-events: none;
+    font-family: Georgia, serif;
+    letter-spacing: 0.15em;
+    font-size: 13px;
+    text-transform: uppercase;
+  }
+  .label-sub {
+    font-family: Arial, sans-serif;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    margin-top: 3px;
+    opacity: 0.7;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="label">
+  Morning Commute
+  <div class="label-sub">07:42 — On Schedule</div>
+</div>
+<script>
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+
+function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+resize();
+window.addEventListener('resize', resize);
+
+// ── Morse: CLEAN ─────────────────────────────────────────────
+// C = -.-. | L = .-.. | E = . | A = .- | N = -.
+const MORSE = [
+  { letter:'C', signals:['dash','dot','dash','dot'] },
+  { letter:'L', signals:['dot','dash','dot','dot'] },
+  { letter:'E', signals:['dot'] },
+  { letter:'A', signals:['dot','dash'] },
+  { letter:'N', signals:['dash','dot'] },
+];
+
+// ── Layout constants ─────────────────────────────────────────
+const DOT_W      = 20;
+const DASH_W     = 48;
+const WIN_H      = 30;
+const WIN_GAP    = 9;
+const CAR_PAD    = 14;
+const CAR_H      = 74;
+const LOCO_W     = 148;
+const LOCO_H     = 86;
+const LETTER_GAP = 22;   // blank gap carriage between letters
+const WHEEL_R    = 11;
+const COUPLER_W  = 10;   // coupler tongue width
+const SPEED      = 4.2;
+
+// ── Pre-compute carriage widths ───────────────────────────────
+function carW(signals) {
+  let w = CAR_PAD * 2;
+  signals.forEach((s, i) => { w += (s==='dot'?DOT_W:DASH_W) + (i<signals.length-1?WIN_GAP:0); });
+  return w;
+}
+
+// Build segment list with absolute x offsets
+const segments = [];
+let cx = 0;
+
+// Locomotive
+segments.push({ type:'loco', x:cx, w:LOCO_W });
+cx += LOCO_W;
+
+MORSE.forEach((ml, li) => {
+  const w = carW(ml.signals);
+  segments.push({ type:'car', x:cx, w, signals:ml.signals });
+  cx += w;
+  if (li < MORSE.length - 1) {
+    segments.push({ type:'gap', x:cx, w:LETTER_GAP });
+    cx += LETTER_GAP;
+  }
+});
+
+const TRAIN_W = cx;
+
+// ── Smoke particles ───────────────────────────────────────────
+const smokes = [];
+
+// ── Pass state ────────────────────────────────────────────────
+let passIndex  = 0;
+let trainX     = 0;
+let dir        = -1; // -1 = RTL, +1 = LTR
+let waiting    = false;
+let waitUntil  = 0;
+// activeSegs: segments ordered so loco is always at the leading end
+let activeSegs = segments.slice();
+
+function initPass() {
+  if (passIndex % 2 === 0) {
+    // RTL: train enters from right, loco on left (normal order)
+    dir = -1;
+    trainX = canvas.width + 30;
+    activeSegs = segments.slice(); // loco first = leftmost = leading
+  } else {
+    // LTR: train enters from left, loco on right (reversed order)
+    dir = 1;
+    // Reverse the segment layout so loco ends up at the right end
+    // We rebuild x offsets from scratch in reversed order
+    const rev = segments.slice().reverse();
+    let rx = 0;
+    activeSegs = rev.map(seg => {
+      const s = Object.assign({}, seg, { x: rx });
+      rx += seg.w;
+      return s;
+    });
+    trainX = -TRAIN_W - 30;
+  }
+}
+initPass();
+
+// ── Hill layout (proportional) ───────────────────────────────
+const HILLS = [
+  { rx:0.05, rw:0.48, rh:0.14, col:'#b0bece' },
+  { rx:0.28, rw:0.62, rh:0.11, col:'#bcc8d4' },
+  { rx:0.55, rw:0.44, rh:0.13, col:'#a8bccb' },
+  { rx:0.72, rw:0.58, rh:0.10, col:'#c0cad6' },
+];
+
+// ── Sleeper scroll ────────────────────────────────────────────
+let sleeperOff = 0;
+const SLEEPER_SPACING = 40;
+
+// ── Drawing helpers ───────────────────────────────────────────
+function rr(x,y,w,h,r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.lineTo(x+w-r,y); ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+  ctx.lineTo(x+w,y+h-r); ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+  ctx.lineTo(x+r,y+h); ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+  ctx.lineTo(x,y+r); ctx.quadraticCurveTo(x,y,x+r,y);
+  ctx.closePath();
+}
+
+function wheel(cx,cy) {
+  ctx.beginPath(); ctx.arc(cx,cy,WHEEL_R,0,Math.PI*2);
+  ctx.fillStyle='#5a6578'; ctx.fill();
+  ctx.strokeStyle='#3e4e60'; ctx.lineWidth=2.5; ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx,cy,WHEEL_R-4,0,Math.PI*2);
+  ctx.fillStyle='#6a7888'; ctx.fill();
+}
+
+function coupler(x,y,h) {
+  // Draw coupling at x (center of joint)
+  ctx.fillStyle='#556070';
+  ctx.fillRect(x-COUPLER_W/2, y+h*0.38, COUPLER_W, 10);
+}
+
+function drawLoco(x, baseY) {
+  const y = baseY - LOCO_H;
+
+  // Chimney
+  ctx.fillStyle='#5c6e82';
+  ctx.fillRect(x+26, y-26, 13, 18);
+  // Chimney cap
+  ctx.fillRect(x+23, y-29, 19, 5);
+
+  // Cab roof
+  ctx.fillStyle='#5c6e82';
+  rr(x+12, y-14, 62, 16, 3); ctx.fill();
+
+  // Main body
+  ctx.fillStyle='#6b7d94';
+  rr(x, y, LOCO_W, LOCO_H, 6); ctx.fill();
+
+  // Light accent strip along top
+  ctx.fillStyle='#7a8da4';
+  ctx.fillRect(x+6, y+4, LOCO_W-12, 5);
+
+  // Cab window
+  ctx.fillStyle='#f2e8c4';
+  rr(x+LOCO_W-56, y+16, 38, 28, 3); ctx.fill();
+  // Glare on window
+  ctx.fillStyle='rgba(255,255,255,0.22)';
+  ctx.fillRect(x+LOCO_W-53, y+19, 32, 4);
+
+  // Small porthole
+  ctx.beginPath();
+  ctx.arc(x+30, y+24, 9, 0, Math.PI*2);
+  ctx.fillStyle='#f2e8c4'; ctx.fill();
+
+  // Front cowcatcher / bumper
+  ctx.fillStyle='#4e606e';
+  ctx.fillRect(x-10, y+LOCO_H*0.35, 12, LOCO_H*0.45);
+  // Horizontal stripe on bumper
+  ctx.fillStyle='#6a7888';
+  ctx.fillRect(x-10, y+LOCO_H*0.52, 12, 4);
+
+  // Wheels (4)
+  const wy = baseY + WHEEL_R - 2;
+  wheel(x+20,  wy);
+  wheel(x+58,  wy);
+  wheel(x+96,  wy);
+  wheel(x+LOCO_W-18, wy);
+
+  // Coupler on back of loco
+  coupler(x+LOCO_W, y, LOCO_H);
+
+  // Return chimney tip for smoke (caller passes trainDir for smoke drift)
+  return { chimneyX: x+32, chimneyY: y-28 };
+}
+
+function drawCar(x, baseY, w, signals) {
+  const y = baseY - CAR_H;
+
+  // Body
+  ctx.fillStyle='#8a9bb0';
+  rr(x, y, w, CAR_H, 3); ctx.fill();
+
+  // Top accent strip
+  ctx.fillStyle='#9aaec4';
+  ctx.fillRect(x+4, y+3, w-8, 5);
+
+  // Underframe
+  ctx.fillStyle='#6b7d94';
+  ctx.fillRect(x+3, baseY-9, w-6, 9);
+
+  // Windows
+  let wx = x + CAR_PAD;
+  const winY = y + (CAR_H - WIN_H) / 2;
+  signals.forEach((sig, i) => {
+    const ww = sig==='dot' ? DOT_W : DASH_W;
+    ctx.fillStyle='#f2e8c4';
+    rr(wx, winY, ww, WIN_H, 2); ctx.fill();
+    // Glare
+    ctx.fillStyle='rgba(255,255,255,0.2)';
+    ctx.fillRect(wx+3, winY+3, ww-6, 4);
+    wx += ww + WIN_GAP;
+  });
+
+  // Wheels
+  const wy   = baseY + WHEEL_R - 2;
+  const nw   = Math.max(2, Math.round(w / 58));
+  const step = (w - 32) / Math.max(1, nw - 1);
+  for (let i=0; i<nw; i++) wheel(x+16+i*step, wy);
+
+  // Couplers both ends
+  coupler(x,   y, CAR_H);
+  coupler(x+w, y, CAR_H);
+}
+
+// ── Main loop ─────────────────────────────────────────────────
+function frame() {
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0,0,W,H);
+
+  // Sky
+  const sg = ctx.createLinearGradient(0,0,0,H);
+  sg.addColorStop(0,'#c8d4e3');
+  sg.addColorStop(0.45,'#dce5ef');
+  sg.addColorStop(0.72,'#e8edf4');
+  sg.addColorStop(1,'#cfd8e4');
+  ctx.fillStyle=sg; ctx.fillRect(0,0,W,H);
+
+  const groundY = H * 0.63;
+
+  // Hills
+  HILLS.forEach(hd => {
+    ctx.fillStyle = hd.col;
+    ctx.beginPath();
+    const hx = hd.rx * W, hw = hd.rw * W, hh = hd.rh * H;
+    ctx.ellipse(hx + hw/2, groundY+6, hw/2, hh, 0, Math.PI, 0);
+    ctx.fill();
+  });
+
+  // Ground
+  const gg = ctx.createLinearGradient(0,groundY,0,H);
+  gg.addColorStop(0,'#b8c4cc'); gg.addColorStop(1,'#9eaab4');
+  ctx.fillStyle=gg; ctx.fillRect(0,groundY,W,H-groundY);
+
+  const trackY = groundY + 6;
+  const baseY  = trackY - 1;
+
+  // Sleepers
+  ctx.fillStyle='#8a9098';
+  const sOff = ((sleeperOff % SLEEPER_SPACING) + SLEEPER_SPACING) % SLEEPER_SPACING;
+  for (let sx = sOff - SLEEPER_SPACING; sx < W + SLEEPER_SPACING; sx += SLEEPER_SPACING) {
+    ctx.fillRect(sx-6, trackY-2, 13, 17);
+  }
+
+  // Rails
+  ctx.fillStyle='#7a8494';
+  ctx.fillRect(0, trackY, W, 4);
+  ctx.fillRect(0, trackY+12, W, 4);
+
+  // Smoke
+  for (let i = smokes.length-1; i>=0; i--) {
+    const p = smokes[i];
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+    ctx.fillStyle=`rgba(200,210,220,${p.opacity.toFixed(2)})`; ctx.fill();
+    p.x += p.vx; p.y += p.vy; p.r += 0.18; p.opacity -= 0.013;
+    if (p.opacity <= 0) smokes.splice(i,1);
+  }
+
+  // ── Waiting between passes ──
+  if (waiting) {
+    if (performance.now() >= waitUntil) {
+      waiting = false;
+      passIndex++;
+      initPass();
+    }
+    requestAnimationFrame(frame);
+    return;
+  }
+
+  // Train segments
+  activeSegs.forEach(seg => {
+    const sx = trainX + seg.x;
+    if (sx + seg.w < -20 || sx > W + 20) return;
+
+    if (seg.type === 'loco') {
+      const res = drawLoco(sx, baseY);
+      if (Math.random() < 0.07) {
+        // Smoke drifts opposite to travel direction
+        smokes.push({ x:res.chimneyX, y:res.chimneyY, r:5, opacity:0.55, vx: dir * -0.5, vy:-0.7 });
+      }
+    } else if (seg.type === 'car') {
+      drawCar(sx, baseY, seg.w, seg.signals);
+    }
+  });
+
+  // Advance
+  trainX += dir * SPEED;
+  sleeperOff += SPEED; // always scroll same direction for visual consistency
+
+  // Check exit — enter waiting state with random delay
+  const gone = dir < 0 ? (trainX + TRAIN_W < -30) : (trainX > W + 30);
+  if (gone) {
+    const delayMs = (6 + Math.random() * 6) * 1000; // 6–12 seconds
+    waiting   = true;
+    waitUntil = performance.now() + delayMs;
+  }
+
+  requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
